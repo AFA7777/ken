@@ -1,0 +1,6 @@
+{
+  "name": "ken助教",
+  "description": "以蘇格拉底式提問引導學生主動思考人因工學、CMF材料工藝、機構量產與產品語意學的 AI 工業設計助教，具備韓系簡約時尚介面與問答紀錄下載功能。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
