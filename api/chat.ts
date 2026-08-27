@@ -1,4 +1,3 @@
-import type { IncomingMessage, ServerResponse } from "http";
 import { GoogleGenAI } from "@google/genai";
 
 const KEN_SYSTEM_PROMPT = `你是工業設計系的助教 Ken。你的目標是引導學生思考，而不是直接給予解答。 規則：
@@ -6,6 +5,9 @@ const KEN_SYSTEM_PROMPT = `你是工業設計系的助教 Ken。你的目標是�
 當學生發問時，請使用「蘇格拉底式提問法」，點出他們可能忽略的工業設計核心觀念（例如：人體工學與握持人因 Ergonomics、CMF 色彩材質表面處理 Color/Material/Finish、機構裝配與量產可行性 DFM/DFA、產品語意學與機能暗示 Product Semantics & Affordance、曲面連續度與光影走勢 G0/G1/G2、永續拆解與生命週期等），並反問他們下一步該怎麼驗證與評估。
 語氣要像是一位溫和、有耐心且在設計工作室陪你討論評圖（Critique）的工業設計學長，適時給予鼓勵。
 全程使用繁體中文回覆。`;
+
+// Candidate models in order of priority for high availability
+const FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -20,6 +22,24 @@ function getGeminiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function isRetryableError(err: any): boolean {
+  const msg = (err?.message || "").toLowerCase();
+  const status = (err?.status || "").toLowerCase();
+  const code = err?.code || err?.status;
+  return (
+    code === 503 ||
+    code === 429 ||
+    code === 500 ||
+    status === "unavailable" ||
+    msg.includes("503") ||
+    msg.includes("429") ||
+    msg.includes("high demand") ||
+    msg.includes("unavailable") ||
+    msg.includes("resource_exhausted") ||
+    msg.includes("overloaded")
+  );
 }
 
 export default async function handler(req: any, res: any) {
@@ -49,7 +69,6 @@ export default async function handler(req: any, res: any) {
         body = {};
       }
     } else if (!body) {
-      // If body is a raw stream in some Node/Vercel environments
       const chunks: any[] = [];
       for await (const chunk of req) {
         chunks.push(chunk);
@@ -92,51 +111,78 @@ export default async function handler(req: any, res: any) {
         res.flushHeaders();
       }
 
-      try {
-        const responseStream = await ai.models.generateContentStream({
-          model: "gemini-3.7-flash",
-          contents,
-          config: {
-            systemInstruction: KEN_SYSTEM_PROMPT,
-            temperature: 0.7,
-          },
-        });
+      let success = false;
+      let lastErrorMessage = "";
 
-        for await (const chunk of responseStream) {
-          const text = chunk.text;
-          if (text) {
-            res.write(`data: ${JSON.stringify({ text })}\n\n`);
-            if (typeof res.flush === "function") {
-              res.flush();
+      for (const modelName of FALLBACK_MODELS) {
+        try {
+          const responseStream = await ai.models.generateContentStream({
+            model: modelName,
+            contents,
+            config: {
+              systemInstruction: KEN_SYSTEM_PROMPT,
+              temperature: 0.7,
+            },
+          });
+
+          for await (const chunk of responseStream) {
+            const text = chunk.text;
+            if (text) {
+              res.write(`data: ${JSON.stringify({ text })}\n\n`);
+              if (typeof res.flush === "function") {
+                res.flush();
+              }
             }
           }
-        }
 
-        res.write(`data: [DONE]\n\n`);
-        res.end();
-      } catch (streamError: any) {
-        console.error("Gemini stream error:", streamError);
-        res.write(
-          `data: ${JSON.stringify({
-            error:
-              streamError?.message ||
-              "連線至 Gemini 時發生異常，請檢查 API 金鑰配額或稍後重試。",
-          })}\n\n`
-        );
+          res.write(`data: [DONE]\n\n`);
+          res.end();
+          success = true;
+          break;
+        } catch (streamError: any) {
+          console.warn(`Model ${modelName} stream failed:`, streamError?.message);
+          lastErrorMessage = streamError?.message || "";
+          if (!isRetryableError(streamError)) {
+            // Not a transient error, break fallback loop
+            break;
+          }
+          // Brief pause before trying next fallback model
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+      }
+
+      if (!success) {
+        let userFriendlyMsg = "Google 伺服器目前負載較高，請點擊下方「重新嘗試提問」再次呼叫 Ken 助教！";
+        if (lastErrorMessage.includes("API_KEY_INVALID") || lastErrorMessage.includes("API key not valid")) {
+          userFriendlyMsg = "GEMINI_API_KEY 金鑰驗證未通過，請檢查 Vercel 上的金鑰設定。";
+        }
+        res.write(`data: ${JSON.stringify({ error: userFriendlyMsg })}\n\n`);
         res.end();
       }
     } else {
-      const response = await ai.models.generateContent({
-        model: "gemini-3.7-flash",
-        contents,
-        config: {
-          systemInstruction: KEN_SYSTEM_PROMPT,
-          temperature: 0.7,
-        },
-      });
+      let lastError: any = null;
+      for (const modelName of FALLBACK_MODELS) {
+        try {
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents,
+            config: {
+              systemInstruction: KEN_SYSTEM_PROMPT,
+              temperature: 0.7,
+            },
+          });
 
-      const replyText = response.text || "Ken 助教目前正在思考中，請稍候重試。";
-      return res.json({ reply: replyText });
+          const replyText = response.text || "Ken 助教目前正在思考中，請稍候重試。";
+          return res.json({ reply: replyText });
+        } catch (err: any) {
+          console.warn(`Model ${modelName} call failed:`, err?.message);
+          lastError = err;
+          if (!isRetryableError(err)) break;
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+      }
+
+      throw lastError || new Error("All models failed");
     }
   } catch (error: any) {
     console.error("Chat API error:", error);

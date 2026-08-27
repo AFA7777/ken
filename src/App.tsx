@@ -205,12 +205,23 @@ export default function App() {
         );
       } else {
         console.error('Chat error:', err);
+        let errorReason = err?.message || '請確認網路連線或 API 金鑰';
+        if (errorReason.includes('high demand') || errorReason.includes('503') || errorReason.includes('UNAVAILABLE')) {
+          errorReason = 'Google 伺服器目前尖峰負載中，已為你準備好重試通道。';
+        } else if (errorReason.includes('{"error"')) {
+          try {
+            const rawJson = JSON.parse(errorReason);
+            errorReason = rawJson?.error?.message || rawJson?.error || errorReason;
+          } catch {
+            // Keep errorReason
+          }
+        }
         setMessages((prev) =>
           prev.map((msg) =>
             msg.id === assistantMessageId
               ? {
                   ...msg,
-                  content: `抱歉，助教學長在連線時遇到了一點小狀況：${err.message || '請確認網路連線'}。你可以點擊下方重新發問！`,
+                  content: `抱歉，助教學長在連線時遇到了一點小狀況：${errorReason}。你可以點擊下方「重新嘗試提問」！`,
                   isStreaming: false,
                   isError: true,
                 }
