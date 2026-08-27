@@ -41,10 +41,39 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
-    const { messages, stream = true } = req.body || {};
+    let body = req.body;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        body = {};
+      }
+    } else if (!body) {
+      // If body is a raw stream in some Node/Vercel environments
+      const chunks: any[] = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
+      }
+      const raw = Buffer.concat(chunks).toString("utf-8");
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        body = {};
+      }
+    }
+
+    const { messages, stream = true } = body || {};
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "訊息格式不正確或訊息列表為空" });
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        error:
+          "未檢測到 GEMINI_API_KEY 環境變數。請在 Vercel 專案設定中的 Environment Variables 加入 GEMINI_API_KEY 並重新部署。",
+      });
     }
 
     const ai = getGeminiClient();
@@ -55,10 +84,13 @@ export default async function handler(req: any, res: any) {
     }));
 
     if (stream) {
-      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
       res.setHeader("Cache-Control", "no-cache, no-transform");
       res.setHeader("Connection", "keep-alive");
-      res.flushHeaders?.();
+      res.setHeader("X-Accel-Buffering", "no");
+      if (res.flushHeaders) {
+        res.flushHeaders();
+      }
 
       try {
         const responseStream = await ai.models.generateContentStream({
@@ -74,6 +106,9 @@ export default async function handler(req: any, res: any) {
           const text = chunk.text;
           if (text) {
             res.write(`data: ${JSON.stringify({ text })}\n\n`);
+            if (typeof res.flush === "function") {
+              res.flush();
+            }
           }
         }
 
@@ -85,7 +120,7 @@ export default async function handler(req: any, res: any) {
           `data: ${JSON.stringify({
             error:
               streamError?.message ||
-              "連線至 Gemini 時發生異常，請稍後再試。",
+              "連線至 Gemini 時發生異常，請檢查 API 金鑰配額或稍後重試。",
           })}\n\n`
         );
         res.end();

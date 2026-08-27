@@ -103,53 +103,81 @@ export default function App() {
         throw new Error(errData.error || `伺服器回應錯誤 (${response.status})`);
       }
 
+      const contentType = response.headers.get('content-type') || '';
+      let accumulatedReply = '';
+
+      if (contentType.includes('application/json')) {
+        const jsonData = await response.json();
+        accumulatedReply = jsonData.reply || jsonData.text || '';
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === assistantMessageId
+              ? {
+                  ...msg,
+                  content:
+                    accumulatedReply ||
+                    'Ken 助教已收到你的提問，請再補充更多工設細節或目前的草模/3D構想，我們一起來推導！',
+                  isStreaming: false,
+                }
+              : msg
+          )
+        );
+        return;
+      }
+
       if (!response.body) {
         throw new Error('無法讀取伺服器串流回應');
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let accumulatedReply = '';
       let buffer = '';
+
+      const processLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) return;
+
+        const dataPayload = trimmed.replace(/^data:\s*/, '');
+        if (dataPayload === '[DONE]') return;
+
+        try {
+          const parsed = JSON.parse(dataPayload);
+          if (parsed.error) {
+            throw new Error(parsed.error);
+          }
+          if (parsed.text) {
+            accumulatedReply += parsed.text;
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === assistantMessageId
+                  ? { ...msg, content: accumulatedReply, isStreaming: true }
+                  : msg
+              )
+            );
+          }
+        } catch (jsonErr: any) {
+          if (jsonErr.message && !jsonErr.message.includes('JSON')) {
+            throw jsonErr;
+          }
+        }
+      };
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
+        const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) continue;
-
-          const dataPayload = trimmed.replace(/^data:\s*/, '');
-          if (dataPayload === '[DONE]') {
-            break;
-          }
-
-          try {
-            const parsed = JSON.parse(dataPayload);
-            if (parsed.error) {
-              throw new Error(parsed.error);
-            }
-            if (parsed.text) {
-              accumulatedReply += parsed.text;
-              setMessages((prev) =>
-                prev.map((msg) =>
-                  msg.id === assistantMessageId
-                    ? { ...msg, content: accumulatedReply, isStreaming: true }
-                    : msg
-                )
-              );
-            }
-          } catch (jsonErr: any) {
-            if (jsonErr.message && !jsonErr.message.includes('JSON')) {
-              throw jsonErr;
-            }
-          }
+          processLine(line);
         }
+      }
+
+      // Process any remaining text in buffer
+      if (buffer.trim()) {
+        processLine(buffer);
       }
 
       // Stream finalized
